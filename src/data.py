@@ -69,3 +69,43 @@ REQUIRED_CHAIN_COLUMNS = [
     "impliedVolatility", "option_type", "expiry",
 ]
 
+_FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO"
+
+# In-memory session for the fred pull (spec: avoid repeated network
+# calls on reruns within a session).
+_rate_cache: dict = {}
+
+# ---------------------------------------------------------------------------
+# Risk-free rate (fallback / diagonstic only -- pricing uses implied DF)
+# ---------------------------------------------------------------------------
+
+def bey_to_continous(y_simple: float, tenor_years: float = 0.25) -> float:
+    '''
+    convert an annualized simple (bond-equivalent) yield to a 
+    continously compounded rate over the given tenor.
+
+    DGS3MO is quoted on an investment (bond-equivalent) basis, so the 
+    3month growth factor is (1 + y * 0.25) and the continuously 
+    compounded equivalent is log(1 + y * 0.25) / 0.25
+
+    Do NOT feed FRED series DTB3 through this function: DTB3 is a
+    discount-basis rate on a 360-day year and understates the yield.
+    '''
+    if not np.isfinite(y_simple) or y_simple <= -1.0 / tenor_years * 0.99:
+        raise ValueError(f"invalid simple yield: {y_simple!r}")
+    return float(np.log1p(y_simple * tenor_years) / tenor_years)
+
+def get_risk_free_rate(config: Optional[dict] = None) -> float:
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
+
+    if cfg["RISK_FREE_RATE"] is not None:
+        r = float(cfg["RISK_FREE_RATE"])
+        assert 0.00 <= r < 0.20, f'rate override {r} outside [0.00, 0.20]'
+        return r
+
+    if "r" in _rate_cache:
+        return _rate_cache["r"]
+
+    try:
+        resp = requests.get(_FRED_CSV_URL, timeout=cfg["FRED_TIMEOUT_S"])
+        resp.raise_for_status()
