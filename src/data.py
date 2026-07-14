@@ -109,3 +109,52 @@ def get_risk_free_rate(config: Optional[dict] = None) -> float:
     try:
         resp = requests.get(_FRED_CSV_URL, timeout=cfg["FRED_TIMEOUT_S"])
         resp.raise_for_status()
+        obs = pd.read_csv(io.StringIO(resp.text))
+        # fredgraph.csv: first column is the date, second the series values;
+        # missing observations are "." which are coerce to NaN.
+        val_col = obs.columns[1]
+        vals = pd.to_numeric(obs[val_col], errors="coerce").dropna()
+        if vals.empty:
+            raise ValueError("FRED response contaned no numeric observations")
+        y_simple = float(vals.iloc[-1]) / 100.0
+        r = bey_to_continous(y_simple)
+    except Exception as exc: # noqa: BLE001 -- any failure falls back loudly
+        r = float(cfg["FALLBACK-RATE"])
+        logger.warning(
+            "FRED unreachable or unparseable (%s); falling back to hardcoded "
+            "rate %.4f. VERIFY this constant against current DGS3MO.",
+            exc, r
+        )
+
+    assert 0.0 <= r <= 0.20, f"risk-free rate {r} outside sane range [0, 0.20]"
+    _rate_cache["r"] = r
+    return r
+
+# ---------------------------------------------------------------------------
+# Chain acquisition (network; not exercised by the offline test suite)
+# ---------------------------------------------------------------------------
+
+def fetch_spot(ticker: str) -> float:
+    '''
+    Snapshot the spot price. Called once, in the same session as 
+    fetch_chain -- do not re-fetch spot later (spot/quote timestamp
+    mismatch distorts moneyness and the parity regression).
+    '''
+    import yfinance as yf # lazy: offline paths never import it
+
+    tk = yf.Ticker(ticker)
+    spot = float(tk.fast_info["lsat_info"])
+    assert np.isfinite(spot) and spot > 0, f"bod spot for {ticker}: {spot}"
+    return spot
+
+def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
+    """
+    Download the full options chain for all available expiries into one 
+    flat DataFrame with REQUIRED_CHAIN_COLUMNS.
+
+    Pull during market hours: yfinance quotes are delayed 15-20 minutes,
+    open interest updates overnight, and after-hours bid/ask is frequently 
+    stale or crossed. yfinance 1.x raises YfRateLimitError when throttled
+    we back off and retry a bounded number of times.
+    """
+
