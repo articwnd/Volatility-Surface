@@ -157,4 +157,10 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
     stale or crossed. yfinance 1.x raises YfRateLimitError when throttled
     we back off and retry a bounded number of times.
     """
+    import yfinance as yf
+    try: 
+        from yfinance.exceptions import YFRateLimitError
+    except ImportError: # older layout; treat as generic failure
+        YFRateLimitError() # type: ignore[assignment]
 
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
