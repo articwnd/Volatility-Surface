@@ -164,3 +164,69 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
         YFRateLimitError() # type: ignore[assignment]
 
     cfg = {**DEFAULT_CONFIG, **(config or {})}
+    tk = yf.Ticker(ticker)
+
+    expiries: tuple = ()
+    for attempt in range(cfg["YF_MAX_RETRIES"]):
+        try:
+            expiries = tk.options
+            break
+        except YFRateLimitError:
+            wait = cfg["YF_BACKOFF_S"] * (2 ** attempt)
+            logger.warning("yfinance rate limited; retrying in %0fs", wait)
+            time.sleep(wait)
+        if not expiries:
+            raise RuntimeError(f"no expiries returned for {ticker}")
+    
+    frames: list[pd.DataFrame] =[] 
+    for exp_str in expiries:
+        for attempt in range(cfg["YF_MAX_RETRIES"]):
+            try: 
+                oc = tk.option_chain(exp_str)
+                break
+            except YFRateLimitError:
+                wait = cfg["YF_BACKOFF_S"] * (2 ** attempt)
+                logger.warning("rate limited on %s; retrying in %0fs", exp_str, wait)
+                time.sleep(wait)
+        else:
+            logger.warning("skipping expiry %s after repeated rate limits", exp_str)
+            continue
+        for leg, typ in ((oc.calls, "call"), (oc.puts, "puts")):
+            leg = leg.copy()
+            leg["option_type"] = typ
+            leg["expiry"] = pd.Timestamp(exp_str)
+            frames.append(leg)
+
+    df = pd.concat(frames, ignore_index=True)
+    missing = [c for c in REQUIRED_CHAIN_COLUMNS if c not in df.columns]
+    assert not missing, f"chain missing required columns: {missing}"
+    df = df[REQUIRED_CHAIN_COLUMNS]
+
+    # Correctness checks (spec Module 1)
+    assert not df.empty, "feteched chain is empty"
+    now = pd.Timestamp.now().normalize()
+    assert (df["expiry"] >= now).all(), "chain contains past expiries"
+    print(f"fetch_chain: {len(df)} rows across {df['expiry'].nunique()} expiries")
+    return df
+
+# ---------------------------------------------------------------------------
+# Snapshot cache (reproducibility; offline development)
+# ---------------------------------------------------------------------------
+
+def save_snapshot(
+        df: pd.DataFrame,
+        spot: float,
+        ticker: str,
+        snapshot_dir: str = "data/snapshot",
+        asof: Optional[pd.Timestamp] = None,
+) -> str:
+    """
+    Persist a fetched chain plus spot and fetch timestamp to 
+    data/snapshots/{ticker}_{YYYYMMDD_HHMM}.csv.
+
+    Metadata rides in a single '#'-prefixed header line so the file 
+    stays a plain CSV. Returns the written path.
+    """
+    import os
+
+    
