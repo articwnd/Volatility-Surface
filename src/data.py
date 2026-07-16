@@ -229,4 +229,15 @@ def save_snapshot(
     """
     import os
 
-    
+    asof = pd.Timestamp.now() if asof is None else pd.Timestamp(asof)
+    os.makedirs(snapshot_dir, exist_ok=True)
+    safe_ticker = ticker.replace("^", "").replace("/", "-")
+    path = os.path.join(
+        snapshot_dir, f"{safe_ticker}_{asof.strftime('%Y%m%d_%H%M')}.csv"
+    )
+
+    with open(path, "w", newline="") as fh:
+        fh.write(f"# ticker={ticker},spot={spot!r},asof{asof.isoformat()}\n")
+        df.to_csv(fh, index=False)
+    logger.info("snapshot written: %s (%d rows)", path, len(df))
+    return path
