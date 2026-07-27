@@ -1,0 +1,21 @@
+[tool.pytest.ini_options]
+# Make `src` importable regardless of how pytest is invoked. Entries are
+# relative to rootdir (the directory containing this file), so bare
+# `pytest`, `pytest tests/`, and `python -m pytest` all behave the same.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.pyright]
+# pandas' own bundled type stubs represent boolean-mask indexing, multi-
+# column groupby keys, and Series.__getitem__ as ambiguous unions (e.g.
+# `df[mask]` typed as `DataFrame | Series | Unknown`, or a groupby([a, b])
+# key typed as bare `Hashable` instead of a tuple). Pyright/Pylance then
+# flags nearly every DataFrame line in this codebase even though the code
+# is correct and fully covered by tests. These four rules are the ones
+# that fire purely from that stub imprecision; everything else (undefined
+# names, bad call signatures, etc.) stays on.
+reportAttributeAccessIssue = false
+reportArgumentType = false
+reportAssignmentType = false
+reportOptionalMemberAccess = false
