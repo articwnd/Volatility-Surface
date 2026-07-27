@@ -169,9 +169,9 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
     """
     import yfinance as yf
     try:
-        from yfinance.exceptions import YfRateLimitError
+        from yfinance.exceptions import YFRateLimitError
     except ImportError:  # older layout; treat as generic failure
-        YfRateLimitError = ()  # type: ignore[assignment]
+        YFRateLimitError = ()  # type: ignore[assignment]
 
     cfg = {**DEFAULT_CONFIG, **(config or {})}
     tk = yf.Ticker(ticker)
@@ -181,7 +181,7 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
         try:
             expiries = tk.options
             break
-        except YfRateLimitError:
+        except YFRateLimitError:
             wait = cfg["YF_BACKOFF_S"] * (2 ** attempt)
             logger.warning("yfinance rate limited; retrying in %.0fs", wait)
             time.sleep(wait)
@@ -194,7 +194,7 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
             try:
                 oc = tk.option_chain(exp_str)
                 break
-            except YfRateLimitError:
+            except YFRateLimitError:
                 wait = cfg["YF_BACKOFF_S"] * (2 ** attempt)
                 logger.warning("rate limited on %s; retrying in %.0fs", exp_str, wait)
                 time.sleep(wait)
@@ -217,7 +217,7 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
     now = pd.Timestamp.now().normalize()
     assert (df["expiry"] >= now).all(), "chain contains past expiries"
     print(f"fetch_chain: {len(df)} rows across {df['expiry'].nunique()} expiries")
-    return df
+    return df  # pyright: ignore[reportReturnType] -- column-list indexing is DataFrame at runtime
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +275,7 @@ def load_snapshot(path: str) -> tuple[pd.DataFrame, float, pd.Timestamp]:
 
     spot = float(meta["spot"])
     asof = pd.Timestamp(meta["asof"])
-    return df, spot, asof
+    return df, spot, asof  # pyright: ignore[reportReturnType] -- asof came from a real isoformat() string, never NaT
 
 
 # ---------------------------------------------------------------------------

@@ -187,7 +187,7 @@ def test_attach_forwards_invariants():
     fwd = out.groupby("expiry")[["F", "DF"]].first()
     assert fwd.loc["2026-08-08", "F"] == pytest.approx(6510.0, abs=1e-6)
     assert fwd.loc["2026-11-06", "F"] == pytest.approx(6540.0, abs=1e-6)
-    assert not out["fwd_fallback"].any()
+    assert not out["fwd_fallback"].any()  # pyright: ignore[reportGeneralTypeIssues] -- .any() on a bool column is a Python bool at runtime
     # OTM-only with correct k signs
     calls = out[out["option_type"] == "call"]
     puts = out[out["option_type"] == "put"]
