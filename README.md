@@ -84,12 +84,21 @@ Two no-arbitrage conditions are enforced before any parametric fit:
 - **Butterfly (strike) arbitrage**: call prices must be convex in strike.
   Because SPX strike spacing is irregular (5/10/25/50 point increments), the
   check uses the spacing-weighted condition on each adjacent triple
-  `K1 < K2 < K3`: flag when `C(K2) > w*C(K1) + (1-w)*C(K3)` with
-  `w = (K3 - K2)/(K3 - K1)`. The unweighted butterfly `C(K1) - 2*C(K2) +
-  C(K3)` is only valid for equally spaced strikes and would produce false
-  flags on real SPX chains. Since only OTM quotes are retained, call prices
-  below the forward are synthesized from puts via parity:
-  `C(K) = P(K) + DF*(F - K)`.
+  `K1 < K2 < K3` with `w = (K3 - K2)/(K3 - K1)`. The check is two-tier:
+  the strict mid-price condition (`C(K2) > w*C(K1) + (1-w)*C(K3)`) is a
+  data-quality diagnostic only, because near tight strike spacing the
+  convexity chord gap is the same order as quote noise and a mid breach
+  inside the bid-ask cannot be monetized. Exclusion from the fit requires
+  an executable violation against the touch: the long butterfly entered at
+  a credit with wings bought at the ask and body sold at the bid
+  (`w*ask(K1) + (1-w)*ask(K3) < bid(K2)`). Since ask >= mid >= bid,
+  executable violations are a subset of mid flags. The unweighted
+  butterfly `C(K1) - 2*C(K2) + C(K3)` is only valid for equally spaced
+  strikes and would produce false flags on real SPX chains. Since only OTM
+  quotes are retained, call bid/mid/ask below the forward are synthesized
+  from puts via parity: `C(K) = P(K) + DF*(F - K)` applied to each quote
+  level (the forward leg is implied from mids and carries no modeled
+  spread, a documented simplification that errs toward flagging).
 - **Calendar spread (time) arbitrage**: total variance `sigma^2 * T` must be
   non-decreasing across maturities at fixed log-forward-moneyness
   `k = log(K/F)`, not at fixed strike (forwards differ across expiries).
@@ -361,6 +370,20 @@ fallback rate).
 
 ## Revision Log
 
+- **r3 (2026-07)**: Two-tier butterfly check. Measured on a synthetic SPX
+  chain with +/-$0.40 quote noise, the strict mid-price convexity check
+  flagged 22% of rows and excluded the densest region of the chain from
+  the fit, despite none of those breaches being monetizable inside the
+  bid-ask. The mid-price check is retained as a data-quality diagnostic;
+  exclusion from the SVI fit now requires an executable violation against
+  the touch (butterfly entered at a credit with wings at the ask, body at
+  the bid). Parity synthesis of the call curve extended to bid and ask.
+  Exclusion policy made explicit in `exclude_flagged`: executable middle
+  strikes are dropped; a calendar-flagged short slice is dropped only when
+  it violates against two or more longer maturities. Also added
+  `check_parity_iv` (call vs. put IV diagnostic on a both-sides frame via
+  `attach_forwards(..., otm_only=False)`) and a root `pyproject.toml`
+  (pytest `pythonpath`) fixing test imports under bare `pytest`.
 - **r2 (2026-07)**: Pre-build spec audit fixes. Replaced external r/q inputs
   with per-expiry parity-implied forward and discount factor; moved pricing
   to Black-76 on the forward (fixes systematic call/put IV split from the
