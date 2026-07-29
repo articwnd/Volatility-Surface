@@ -7,14 +7,21 @@ Pipeline position:
         -> [Module 4: svi]  (flagged strikes/slices excluded from the fit)
 
 Design notes (see PROJECT_SPEC.md r2):
-- Butterfly: call prices must be convex in strike. SPX strike spacing is
-  irregular (5/10/25/50 point increments), so the check uses the
-  spacing-weighted condition on each adjacent triple; the unweighted
-  butterfly C(K1) - 2C(K2) + C(K3) is only valid for equal spacing and
-  false-flags real chains (pinned by test_equal_spacing_formula_would_misfire).
+- Butterfly is TWO-TIER (r3). Tier 1 (diagnostic): strict convexity of
+  MID call prices -- flags data-quality issues but, near tight strike
+  spacing, mostly measures quote noise (the true chord gap is the same
+  order as the bid-ask). Tier 2 (exclusion trigger): EXECUTABLE
+  arbitrage only -- the long butterfly must be enterable at a credit
+  against the touch, wings bought at the ask and body sold at the bid.
+  A mid-price convexity breach inside the spread cannot be monetized and
+  must not gut the fit input. Since ask >= mid >= bid implies
+  B_exec >= B_mid, every executable violation is also a mid violation:
+  one pass computes both.
 - Only OTM quotes survive Module 1, so the call curve below the forward is
-  synthesized from puts via parity C(K) = P(K) + DF*(F - K). The shared
-  parity-implied (F, DF) makes this exact for parity-consistent quotes.
+  synthesized from puts via parity C(K) = P(K) + DF*(F - K), applied to
+  bid, mid, and ask alike (the parity offset is a cash-and-forward
+  position; the forward leg is implied from mids and carries no modeled
+  spread -- documented simplification).
 - Calendar: total variance must be non-decreasing in T at fixed
   log-forward-moneyness k (NOT fixed strike -- forwards differ by expiry).
   This pre-fit check covers a band around k = 0 only; global calendar
@@ -41,7 +48,8 @@ DEFAULT_ARB_CONFIG: dict = {
     "FLAGS_CSV": os.path.join("outputs", "arbitrage_flags.csv"),
 }
 
-BUTTERFLY_COLUMNS = ["expiry", "K1", "K2", "K3", "C1", "C2", "C3", "B_value"]
+BUTTERFLY_COLUMNS = ["expiry", "K1", "K2", "K3", "C1", "C2", "C3",
+                     "B_value", "B_exec", "executable"]
 CALENDAR_COLUMNS = ["k_bucket", "expiry_short", "expiry_long",
                     "T_short", "T_long", "w_short", "w_long", "k_short",
                     "k_long"]
@@ -52,14 +60,25 @@ CALENDAR_COLUMNS = ["k_bucket", "expiry_short", "expiry_long",
 # ---------------------------------------------------------------------------
 
 def synthesize_call_curve(df_slice: pd.DataFrame) -> pd.DataFrame:
-    """Build a single call-price curve C(K) for one expiry from OTM quotes.
+    """Build call-price curves (bid/mid/ask) for one expiry from OTM
+    quotes.
 
-    Actual call mids are used for K >= F; put mids are converted via
-    parity C(K) = P(K) + DF*(F - K) for K < F. At a strike carrying both
-    (possible exactly at K = F), the actual call is preferred. Output is
-    sorted by strike with one row per strike.
+    Actual call quotes are used for K >= F; put quotes are converted via
+    parity for K < F. The parity offset DF*(F - K) is a cash-and-forward
+    position added to bid, mid, and ask alike: buying the synthetic call
+    means buying the put (pay the ask), selling it means selling the put
+    (receive the bid). The forward leg is implied from mids and carries
+    no modeled spread -- a documented simplification that makes the
+    executable tier slightly AGGRESSIVE (real synthetic-leg costs are
+    higher), i.e. it errs toward flagging.
 
-    Requires columns: strike, mid_price, option_type, F, DF.
+    At a strike carrying both sides (possible exactly at K = F), the
+    actual call is preferred. Output is sorted by strike, one row per
+    strike, columns: strike, call_price (mid), call_bid, call_ask.
+
+    If bid/ask columns are absent, both collapse to the mid and the
+    executable tier degenerates to the strict tier -- logged loudly,
+    because exclusion then reverts to noise-sensitive mid behavior.
     """
     required = {"strike", "mid_price", "option_type", "F", "DF"}
     missing = required - set(df_slice.columns)
@@ -71,12 +90,26 @@ def synthesize_call_curve(df_slice: pd.DataFrame) -> pd.DataFrame:
     F = float(df_slice["F"].iloc[0])
     DF = float(df_slice["DF"].iloc[0])
 
-    out = df_slice[["strike", "mid_price", "option_type"]].copy()
+    has_quotes = {"bid", "ask"} <= set(df_slice.columns)
+    if not has_quotes:
+        logger.warning(
+            "synthesize_call_curve: no bid/ask columns; executable tier "
+            "degenerates to the strict mid tier for this slice"
+        )
+
+    cols = ["strike", "mid_price", "option_type"] + (
+        ["bid", "ask"] if has_quotes else [])
+    out = df_slice[cols].copy()
+    if not has_quotes:
+        out["bid"] = out["mid_price"]
+        out["ask"] = out["mid_price"]
+
+    offset = pd.Series(0.0, index=out.index)
     is_put = out["option_type"] == "put"
-    out["call_price"] = out["mid_price"]
-    out.loc[is_put, "call_price"] = (
-        out.loc[is_put, "mid_price"] + DF * (F - out.loc[is_put, "strike"])
-    )
+    offset[is_put] = DF * (F - out.loc[is_put, "strike"])
+    out["call_price"] = out["mid_price"] + offset
+    out["call_bid"] = out["bid"] + offset
+    out["call_ask"] = out["ask"] + offset
 
     # Prefer the actual call where both sides exist at one strike.
     out = (
@@ -85,7 +118,7 @@ def synthesize_call_curve(df_slice: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
-    # Synthesized calls must be non-negative up to quote noise; a large
+    # Synthesized mids must be non-negative up to quote noise; a large
     # negative value means (F, DF) or the quote is bad.
     bad = out["call_price"] < -1e-6
     if bad.any():
@@ -94,7 +127,7 @@ def synthesize_call_curve(df_slice: pd.DataFrame) -> pd.DataFrame:
             "worst %.6f -- check quotes / implied forward",
             int(bad.sum()), float(out.loc[bad, "call_price"].min()),
         )
-    return out[["strike", "call_price"]]
+    return out[["strike", "call_price", "call_bid", "call_ask"]]
 
 
 # ---------------------------------------------------------------------------
@@ -103,25 +136,35 @@ def synthesize_call_curve(df_slice: pd.DataFrame) -> pd.DataFrame:
 
 def check_butterfly(df_slice: pd.DataFrame, expiry,
                     config: Optional[dict] = None) -> pd.DataFrame:
-    """Spacing-weighted convexity check for one expiry slice.
+    """Two-tier spacing-weighted convexity check for one expiry slice.
 
-    For each adjacent strike triple K1 < K2 < K3:
+    For each adjacent strike triple K1 < K2 < K3 with w = (K3-K2)/(K3-K1):
 
-        w = (K3 - K2) / (K3 - K1)
-        B_value = w*C(K1) + (1 - w)*C(K3) - C(K2)
+        B_value = w*C_mid(K1) + (1-w)*C_mid(K3) - C_mid(K2)   [tier 1]
+        B_exec  = w*C_ask(K1) + (1-w)*C_ask(K3) - C_bid(K2)   [tier 2]
 
-    B_value < -eps flags a violation (the middle price sits above the
-    chord => non-convex => negative implied density). The unweighted form
-    C(K1) - 2C(K2) + C(K3) is NOT equivalent under unequal spacing and
-    must not be used.
+    Tier 1 (B_value < -eps) is a DIAGNOSTIC: non-convex mids imply
+    negative density at mid prices, but near tight spacing the chord gap
+    is the same order as quote noise, so most tier-1 flags inside the
+    spread are unmonetizable. Tier 2 (B_exec < -eps) is the EXCLUSION
+    trigger: the long fly (buy wings at ask, sell body at bid) enters at
+    a credit for a non-negative payoff -- executable arbitrage against
+    the touch. Since ask >= mid >= bid, B_exec >= B_value, so executable
+    violations are a subset of tier-1 flags; the returned frame contains
+    all tier-1 rows with an `executable` boolean marking tier 2.
 
-    Returns a DataFrame (BUTTERFLY_COLUMNS) of violating triples; empty
-    means clean.
+    The unweighted form C(K1) - 2C(K2) + C(K3) is NOT equivalent under
+    unequal spacing and must not be used.
+
+    Returns a DataFrame (BUTTERFLY_COLUMNS); empty means clean at tier 1
+    (and therefore at tier 2).
     """
     cfg = {**DEFAULT_ARB_CONFIG, **(config or {})}
     curve = synthesize_call_curve(df_slice)
     K = curve["strike"].to_numpy(dtype=np.float64)
     C = curve["call_price"].to_numpy(dtype=np.float64)
+    Cb = curve["call_bid"].to_numpy(dtype=np.float64)
+    Ca = curve["call_ask"].to_numpy(dtype=np.float64)
 
     rows = []
     if len(K) >= 3:
@@ -129,12 +172,15 @@ def check_butterfly(df_slice: pd.DataFrame, expiry,
         C1, C2, C3 = C[:-2], C[1:-1], C[2:]
         w = (K3 - K2) / (K3 - K1)
         B = w * C1 + (1.0 - w) * C3 - C2
-        viol = B < -cfg["BUTTERFLY_EPS"]
+        B_exec = w * Ca[:-2] + (1.0 - w) * Ca[2:] - Cb[1:-1]
+        eps = cfg["BUTTERFLY_EPS"]
+        viol = B < -eps
         for i in np.flatnonzero(viol):
             rows.append({
                 "expiry": expiry, "K1": K1[i], "K2": K2[i], "K3": K3[i],
                 "C1": C1[i], "C2": C2[i], "C3": C3[i],
-                "B_value": float(B[i]),
+                "B_value": float(B[i]), "B_exec": float(B_exec[i]),
+                "executable": bool(B_exec[i] < -eps),
             })
     return pd.DataFrame(rows, columns=BUTTERFLY_COLUMNS)
 
@@ -232,41 +278,56 @@ def run_arbitrage_checks(df: pd.DataFrame,
     combined[cols].to_csv(csv_path, index=False)
 
     n_exp_bf = butterfly_flags["expiry"].nunique() if not butterfly_flags.empty else 0
+    n_exec = int(butterfly_flags["executable"].sum()) if not butterfly_flags.empty else 0
     print(
-        f"run_arbitrage_checks: {len(butterfly_flags)} butterfly violations "
-        f"across {n_exp_bf} expiries, {len(calendar_flags)} calendar "
-        f"violations -> {csv_path}"
+        f"run_arbitrage_checks: {len(butterfly_flags)} butterfly mid-flags "
+        f"across {n_exp_bf} expiries ({n_exec} executable at the touch), "
+        f"{len(calendar_flags)} calendar violations -> {csv_path}"
     )
     return butterfly_flags, calendar_flags
 
 
 def exclude_flagged(df: pd.DataFrame, butterfly_flags: pd.DataFrame,
                     calendar_flags: pd.DataFrame) -> pd.DataFrame:
-    """Drop flagged middle strikes (butterfly) and short legs of flagged
-    calendar pairs from the frame handed to the SVI fit. The excluded
-    rows remain in the flags CSV -- exclusion is from the FIT only, per
-    spec ('flagged and excluded from the parametric fit').
+    """Drop EXECUTABLE butterfly middle strikes and repeat-offender
+    calendar slices from the frame handed to the SVI fit. All flagged
+    rows (executable or not) remain in the flags CSV -- exclusion is
+    from the FIT only, per spec.
 
-    Butterfly: the middle strike K2 is the one priced above the chord, so
-    it is the strike removed per flagged triple.
+    Butterfly (r3, two-tier): only triples with `executable=True` (fly
+    enterable at a credit against the touch) trigger exclusion of the
+    middle strike K2. Mid-only flags inside the bid-ask are quote noise,
+    not arbitrage, and excluding them would gut the densest, most liquid
+    region of real chains (measured: 22% of rows on a +/-$0.40-noise
+    synthetic SPX chain).
     Calendar: the SHORT expiry of a violating pair carries the excess
-    variance; its ATM region is suspect, so the whole short slice is
-    dropped only if it violates against 2+ longer maturities (one pair
-    may be the long slice's fault); otherwise it is kept and merely
-    logged. This is a pragmatic rule, stated here so it can be argued
-    with rather than discovered.
+    variance; the whole short slice is dropped only if it violates
+    against 2+ longer maturities (one pair may be the long slice's
+    fault); otherwise it is kept and merely logged. This is a pragmatic
+    rule, stated here so it can be argued with rather than discovered.
     """
     out = df
     if not butterfly_flags.empty:
-        bad = set(zip(butterfly_flags["expiry"], butterfly_flags["K2"]))
-        mask = [
-            (exp, k) not in bad
-            for exp, k in zip(out["expiry"], out["strike"])
-        ]
-        n_drop = len(out) - int(np.sum(mask))
-        out = out[np.array(mask)]
-        logger.info("exclude_flagged: dropped %d butterfly-flagged strikes",
-                    n_drop)
+        exec_flags = butterfly_flags[butterfly_flags["executable"]]
+        n_noise = len(butterfly_flags) - len(exec_flags)
+        if n_noise:
+            logger.info(
+                "exclude_flagged: %d mid-only butterfly flag(s) inside the "
+                "spread retained in the fit (diagnostic tier, not "
+                "executable)", n_noise,
+            )
+        if not exec_flags.empty:
+            bad = set(zip(exec_flags["expiry"], exec_flags["K2"]))
+            mask = [
+                (exp, k) not in bad
+                for exp, k in zip(out["expiry"], out["strike"])
+            ]
+            n_drop = len(out) - int(np.sum(mask))
+            out = out[np.array(mask)]
+            logger.info(
+                "exclude_flagged: dropped %d strike(s) with EXECUTABLE "
+                "butterfly arbitrage", n_drop,
+            )
     if not calendar_flags.empty:
         counts = calendar_flags["expiry_short"].value_counts()
         drop_expiries = set(counts[counts >= 2].index)

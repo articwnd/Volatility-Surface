@@ -24,18 +24,25 @@ EXPIRY = pd.Timestamp("2026-08-08")
 
 
 def _otm_slice(strikes, F_=F, DF_=DF, T_=T, expiry=EXPIRY,
-               atm_vol=0.18, skew=0.15):
+               atm_vol=0.18, skew=0.15, half_spread=None):
     """OTM-only slice shaped like compute_iv_surface output: puts below
-    the forward, calls above, exact B76 mids from a skewed smile."""
+    the forward, calls above, exact B76 mids from a skewed smile.
+    `half_spread` (price units) adds symmetric bid/ask around the mid;
+    None omits the columns (degenerate executable tier)."""
     rows = []
     for K in np.asarray(strikes, dtype=np.float64):
         iv = atm_vol + skew * np.log(F_ / K)
         typ = "put" if K <= F_ else "call"
-        rows.append({
+        mid = b76_price(F_, K, DF_, T_, iv, typ)
+        row = {
             "expiry": expiry, "strike": K, "option_type": typ,
-            "mid_price": b76_price(F_, K, DF_, T_, iv, typ),
+            "mid_price": mid,
             "F": F_, "DF": DF_, "T": T_, "k": np.log(K / F_), "iv": iv,
-        })
+        }
+        if half_spread is not None:
+            row["bid"] = max(mid - half_spread, 0.0)
+            row["ask"] = mid + half_spread
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -96,6 +103,86 @@ def test_synthesized_calls():
         iv = 0.18 + 0.15 * np.log(F / K)
         C_direct = b76_price(F, K, DF, T, iv, "call")
         assert C_synth == pytest.approx(C_direct, abs=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Two-tier butterfly (r3): mid diagnostic vs. executable exclusion
+# ---------------------------------------------------------------------------
+
+def test_synth_call_bid_ask_offset():
+    """The parity offset is applied to bid and ask alike: synthetic call
+    bid/ask equal put bid/ask + DF*(F - K); actual calls pass through."""
+    hs = 0.35
+    df = _otm_slice(UNEQUAL_STRIKES, half_spread=hs)
+    curve = synthesize_call_curve(df).set_index("strike")
+    for _, row in df.iterrows():
+        K = row["strike"]
+        offset = DF * (F - K) if row["option_type"] == "put" else 0.0
+        assert curve.loc[K, "call_bid"] == pytest.approx(
+            row["bid"] + offset, abs=1e-12)
+        assert curve.loc[K, "call_ask"] == pytest.approx(
+            row["ask"] + offset, abs=1e-12)
+    # spread ordering survives the conversion
+    assert (curve["call_bid"] <= curve["call_price"] + 1e-12).all()
+    assert (curve["call_price"] <= curve["call_ask"] + 1e-12).all()
+
+
+def test_exec_dominates_mid():
+    """With valid quotes (bid <= mid <= ask), B_exec >= B_value on every
+    triple, so executable violations are a subset of mid flags."""
+    df = _otm_slice(UNEQUAL_STRIKES, half_spread=0.35).copy()
+    df.loc[df["strike"] == 6500.0, "mid_price"] += 0.5  # some mid flags
+    df.loc[df["strike"] == 6500.0, "ask"] += 0.5
+    flags = check_butterfly(df, EXPIRY)
+    assert not flags.empty
+    assert (flags["B_exec"] >= flags["B_value"] - 1e-12).all()
+
+
+def test_mid_flag_inside_spread_not_excluded():
+    """A convexity breach smaller than the spread: tier-1 flag fires,
+    executable is False, and exclude_flagged keeps the strike."""
+    hs = 0.35
+    df = _otm_slice(UNEQUAL_STRIKES, half_spread=hs).copy()
+    bad_K = 6500.0
+    # Thresholds at 25-pt spacing: mid flag needs bump > chord gap
+    # (~$0.37 here); executable needs bump > chord gap + 2*half_spread
+    # (~$1.07). 0.60 sits between them: tier-1 fires, tier-2 must not.
+    bump = 0.60
+    mask = df["strike"] == bad_K
+    df.loc[mask, ["mid_price", "bid", "ask"]] += bump
+    flags = check_butterfly(df, EXPIRY)
+    assert not flags.empty
+    assert bad_K in set(flags["K2"])
+    assert not flags.loc[flags["K2"] == bad_K, "executable"].any()
+    out = exclude_flagged(df, flags, check_calendar(df))
+    assert bad_K in set(out["strike"])  # kept: not monetizable
+
+
+def test_violation_beyond_spread_excluded():
+    """A breach large enough that the fly is a credit against the touch:
+    executable is True and the strike is excluded from the fit."""
+    hs = 0.35
+    df = _otm_slice(UNEQUAL_STRIKES, half_spread=hs).copy()
+    bad_K = 6500.0
+    mask = df["strike"] == bad_K
+    df.loc[mask, ["mid_price", "bid", "ask"]] += 5.0  # >> spread + chord gap
+    flags = check_butterfly(df, EXPIRY)
+    exec_at_bad = flags.loc[flags["K2"] == bad_K, "executable"]
+    assert exec_at_bad.any()
+    out = exclude_flagged(df, flags, check_calendar(df))
+    assert bad_K not in set(out["strike"])
+
+
+def test_degenerate_without_quotes_matches_strict():
+    """No bid/ask columns: B_exec collapses to B_value and every mid
+    flag is executable (documented degenerate mode)."""
+    df = _otm_slice(UNEQUAL_STRIKES).copy()
+    df.loc[df["strike"] == 6500.0, "mid_price"] += 5.0
+    flags = check_butterfly(df, EXPIRY)
+    assert not flags.empty
+    np.testing.assert_allclose(flags["B_exec"], flags["B_value"],
+                               rtol=0, atol=1e-12)
+    assert flags["executable"].all()
 
 
 def test_clean_calendar():
