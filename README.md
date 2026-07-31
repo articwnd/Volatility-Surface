@@ -370,6 +370,19 @@ fallback rate).
 
 ## Revision Log
 
+- **r4 (2026-07)**: Modules 4-6 built and verified. Added SVI
+  identifiability diagnostics (bound-rail warning on all parameters,
+  vertex-outside-observed-k warning), motivated by fits that were
+  1bp-accurate inside the data yet carried arbitrary wings. Added
+  `check_fitted_calendar` (fitted adjacent slices evaluated on a k grid
+  for crossings, since the Module 3 pre-fit check covers raw quotes in
+  an ATM band only). Pinned surface clamp semantics: out-of-range
+  maturity queries return the edge slice's own IV (full clamp), warned
+  once per interpolator. `python -m src.surface --from-snapshot` runs
+  Modules 1-6 end to end and restricts the rendered moneyness grid to
+  roughly the observed range, consistent with the identifiability
+  caveats. 3D HTML is self-contained (plotly.js inlined).
+
 - **r3 (2026-07)**: Two-tier butterfly check. Measured on a synthetic SPX
   chain with +/-$0.40 quote noise, the strict mid-price convexity check
   flagged 22% of rows and excluded the densest region of the chain from

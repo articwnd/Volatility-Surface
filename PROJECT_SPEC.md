@@ -545,6 +545,13 @@ global-then-local optimizer.
    a fitted slope above it implies the surface prices non-existent
    moments and will misbehave under wing extrapolation. Record the flag
    in the output dict; do not silently clip.
+6. **Identifiability diagnostics (r4)**: warn when any fitted
+   parameter rails at its box bound, and separately when the fitted
+   vertex `m` lies outside the observed k range (railed or not). Either
+   means the data does not identify the parameter -- the fit is usable
+   for interpolation INSIDE the observed strikes but the wings are
+   arbitrary. Typical trigger: a slice with little smile convexity or
+   few quotes. Warn, never clip.
 
 **Returns**: `dict` with keys
 `{a, b, rho, m, sigma, rmse, lee_flag, expiry, T, F, DF}`.
@@ -606,15 +613,27 @@ IV values in decimal form.
 
 ---
 
+### `check_fitted_calendar(svi_params: pd.DataFrame, k_grid) -> pd.DataFrame`  *(added r4)*
+
+**What it does**: evaluates adjacent FITTED slices on a k grid and
+reports crossings `w_short(k) > w_long(k)` with the crossing region and
+worst gap. Module 3 checks only the RAW quotes in an ATM band; fitted
+wings can still cross (especially on bound-railed or thin slices), and
+linear time interpolation is only calendar-arbitrage-free where the
+containment holds. Run before trusting queries away from the money.
+Empty result means clean on the grid.
+
 ### `build_interpolator(svi_params: pd.DataFrame, spot: float) -> Callable`
 
 **What it does**: returns a query function `interp(T, K) -> iv` built
 directly on the fitted slices.
 
 **Algorithm for a query (T, K)**:
-1. If `T` is outside `[T_min, T_max]` of the fitted slices: clamp to the
-   nearest slice and log a warning once per session. Do not extrapolate
-   in time.
+1. If `T` is outside `[T_min, T_max]` of the fitted slices: FULL clamp
+   to the nearest slice -- the returned value is that slice's own IV at
+   the query's k under the slice's own T and forward (not a
+   flat-total-variance extrapolation at the query T). Warn once per
+   interpolator. Do not extrapolate in time.
 2. Find bracketing fitted maturities `T_i <= T <= T_j`.
 3. Interpolate the forward: `log F(T)` linear in `T` between
    `log F_i` and `log F_j`.
@@ -745,6 +764,28 @@ All tests run offline on synthetic data. No test may touch the network.
 | `test_rmse_threshold` | RMSE on a well-behaved smile is below 0.005 |
 | `test_lee_flag` | Params with b*(1+|rho|) > 2 set lee_flag |
 | `test_calendar_preserved_by_interp` | Two clean slices linearly interpolated in w produce no calendar violation at any intermediate T |
+
+### `tests/test_surface.py`  *(added r4)*
+
+| Test | What to verify |
+|---|---|
+| `test_grid_shape_and_values` | iv matrix is (n_expiries, n_strikes) and matches direct SVI evaluation per slice forward |
+| `test_knot_exactness` | Query at a fitted maturity returns that slice's own value to 1e-15 |
+| `test_interior_finite_and_calendar_monotone` | Finite IVs inside the range; w non-decreasing in T at fixed k through the public API |
+| `test_midpoint_linear_in_w_and_logF` | Midpoint w is the slice average; F(T) is the geometric mean under log-linear interpolation |
+| `test_clamp_no_extrapolation` | Out-of-range T returns the edge slice's value; warned once per interpolator |
+| `test_single_slice_degenerates_to_that_slice` | One fitted slice: every T maps to it |
+| `test_fitted_calendar_crossing_detected` | Injected slice crossing reported, fields agree with direct evaluation |
+
+### `tests/test_viz.py`  *(added r4)*
+
+| Test | What to verify |
+|---|---|
+| `test_plot_3d_surface_selfcontained` | HTML > 1MB (plotly.js inlined, opens offline), axis titles and custom title present |
+| `test_plot_smile_slices` | One rendered PNG per fitted expiry |
+| `test_plot_smile_skips_unfitted_expiry` | Excluded slices skipped with a warning, not crashed on |
+| `test_atm_forward_selection` | Term structure picks min-abs-k per expiry (ATM-forward, not spot-ATM) |
+| `test_plot_term_structure` | PNG written and non-trivial |
 
 ---
 
