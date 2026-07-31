@@ -225,3 +225,69 @@ def query_surface(interp: Callable[[float, float], float],
                   T: float, K: float) -> float:
     """Convenience wrapper: implied volatility at one (T, K) point."""
     return interp(T, K)
+
+
+# ---------------------------------------------------------------------------
+# CLI: python -m src.surface --from-snapshot data/snapshots/SPX_....csv
+# ---------------------------------------------------------------------------
+
+def _main() -> None:
+    import argparse
+
+    from src.arbitrage import exclude_flagged, run_arbitrage_checks
+    from src.data import attach_forwards, clean_chain, load_snapshot
+    from src.iv_solver import compute_iv_surface
+    from src.svi import calibrate_all_slices
+    from src.viz import (plot_3d_surface, plot_smile_slices,
+                         plot_term_structure)
+
+    parser = argparse.ArgumentParser(
+        description="Modules 1-6: build and render the full surface")
+    parser.add_argument("--from-snapshot", required=True,
+                        help="snapshot CSV written by src.data --snapshot "
+                             "(live pulls happen in src.data, not here)")
+    parser.add_argument("--outputs", default="outputs")
+    parser.add_argument("--grid-lo", type=float, default=0.85)
+    parser.add_argument("--grid-hi", type=float, default=1.15)
+    parser.add_argument("--grid-n", type=int, default=120)
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    chain, spot, asof = load_snapshot(args.from_snapshot)
+    clean = clean_chain(chain, spot, asof=asof)
+    surf_df = compute_iv_surface(attach_forwards(clean, spot))
+    bf, cal = run_arbitrage_checks(surf_df)
+    fit_input = exclude_flagged(surf_df, bf, cal)
+    params = calibrate_all_slices(fit_input)
+
+    xc = check_fitted_calendar(params)
+    if not xc.empty:
+        print("FITTED-SLICE CALENDAR CROSSINGS (interpolation not "
+              "arbitrage-free in these regions):")
+        print(xc.to_string(index=False))
+
+    # Restrict the plotted grid to roughly the observed moneyness range;
+    # the identifiability diagnostics in Module 4 say wings beyond the
+    # data are not to be trusted, so we do not render them.
+    m_grid = np.linspace(args.grid_lo, args.grid_hi, args.grid_n)
+    iv_matrix = evaluate_svi_grid(params, m_grid, spot)
+    T_grid = params.sort_values("T")["T"].to_numpy(dtype=np.float64)
+
+    html = plot_3d_surface(
+        iv_matrix, m_grid, T_grid,
+        output_path=f"{args.outputs}/vol_surface.html",
+        title=f"IV surface -- spot {spot:.2f} @ {asof}",
+    )
+    smiles = plot_smile_slices(fit_input, params, f"{args.outputs}/smiles")
+    ts = plot_term_structure(fit_input, f"{args.outputs}/term_structure.png")
+
+    interp = build_interpolator(params, spot)
+    T_mid = float(0.5 * (T_grid[0] + T_grid[-1]))
+    print(f"sample query: iv(T={T_mid:.3f}, K={spot:.0f}) = "
+          f"{interp(T_mid, spot):.4f}")
+    print(f"outputs: {html}, {len(smiles)} smile plot(s), {ts}")
+
+
+if __name__ == "__main__":
+    _main()
