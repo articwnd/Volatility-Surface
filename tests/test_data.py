@@ -14,8 +14,10 @@ from src.data import (
     attach_forwards,
     bey_to_continuous,
     clean_chain,
+    filter_option_root,
     implied_forward,
     load_snapshot,
+    option_root,
     save_snapshot,
 )
 
@@ -187,7 +189,7 @@ def test_attach_forwards_invariants():
     fwd = out.groupby("expiry")[["F", "DF"]].first()
     assert fwd.loc["2026-08-08", "F"] == pytest.approx(6510.0, abs=1e-6)
     assert fwd.loc["2026-11-06", "F"] == pytest.approx(6540.0, abs=1e-6)
-    assert not out["fwd_fallback"].any()  # pyright: ignore[reportGeneralTypeIssues] -- .any() on a bool column is a Python bool at runtime
+    assert not out["fwd_fallback"].any()
     # OTM-only with correct k signs
     calls = out[out["option_type"] == "call"]
     puts = out[out["option_type"] == "put"]
@@ -196,3 +198,92 @@ def test_attach_forwards_invariants():
     # k is log(K/F)
     np.testing.assert_allclose(out["k"], np.log(out["strike"] / out["F"]),
                                rtol=0, atol=1e-15)
+
+
+# ---------------------------------------------------------------------------
+# r5: crossed-quote guard and option-root filter
+# ---------------------------------------------------------------------------
+
+def test_crossed_quote_filter():
+    """Rows with ask < bid or ask <= 0 are not markets and must drop."""
+    df = make_chain()
+    bad = df.iloc[:2].copy()
+    bad.loc[bad.index[0], ["bid", "ask"]] = [5.0, 4.0]   # crossed
+    bad.loc[bad.index[1], "ask"] = 0.0                    # no offer
+    out = clean_chain(pd.concat([df, bad], ignore_index=True), SPOT,
+                      OFFLINE_CFG, asof=ASOF)
+    assert len(out) == len(clean_chain(df, SPOT, OFFLINE_CFG, asof=ASOF))
+
+
+def test_option_root_parsing():
+    assert option_root("SPXW260821C05700000") == "SPXW"
+    assert option_root("SPX260821P05700000") == "SPX"
+    assert option_root("AAPL260821C00200000") == "AAPL"
+
+
+def _with_roots(df, root):
+    df = df.copy()
+    df["contractSymbol"] = [
+        f"{root}{pd.Timestamp(e).strftime('%y%m%d')}"
+        f"{'C' if t == 'call' else 'P'}{int(k * 1000):08d}"
+        for e, t, k in zip(df["expiry"], df["option_type"], df["strike"])
+    ]
+    return df
+
+
+def test_root_filter_prefers_spxw_and_keeps_single_root():
+    """A third-Friday-style expiry with BOTH roots keeps only SPXW; an
+    expiry with only SPX keeps SPX (no data loss)."""
+    mixed_w = _with_roots(synthetic_expiry(
+        6510.0, 0.9970, 30 / 365, SPOT,
+        np.arange(6200, 6900, 50.0), "2026-08-08"), "SPXW")
+    mixed_x = _with_roots(synthetic_expiry(
+        6512.0, 0.9969, 30 / 365, SPOT,      # settlement-basis offset
+        np.arange(6225, 6925, 50.0), "2026-08-08"), "SPX")
+    only_x = _with_roots(synthetic_expiry(
+        6540.0, 0.9880, 120 / 365, SPOT,
+        np.arange(6100, 7100, 50.0), "2026-11-06"), "SPX")
+    chain = pd.concat([mixed_w, mixed_x, only_x], ignore_index=True)
+    out = filter_option_root(chain, OFFLINE_CFG)
+    aug = out[out["expiry"] == pd.Timestamp("2026-08-08")]
+    nov = out[out["expiry"] == pd.Timestamp("2026-11-06")]
+    assert set(aug["contractSymbol"].map(option_root)) == {"SPXW"}
+    assert len(aug) == len(mixed_w)
+    assert set(nov["contractSymbol"].map(option_root)) == {"SPX"}
+    assert len(nov) == len(only_x)
+
+
+def test_root_filter_noop_without_column(caplog):
+    df = make_chain()  # no contractSymbol
+    out = filter_option_root(df, OFFLINE_CFG)
+    assert len(out) == len(df)
+    assert any("root filter skipped" in r.message for r in caplog.records)
+
+
+def test_root_mixing_creates_then_filter_removes_phantom_flags():
+    """Integration: interleaved SPX/SPXW curves manufacture vertical/
+    butterfly flags; the root filter removes them at the source."""
+    from src.arbitrage import DEFAULT_ARB_CONFIG, run_arbitrage_checks
+    from src.iv_solver import compute_iv_surface
+
+    w_leg = _with_roots(synthetic_expiry(
+        6510.0, 0.9970, 30 / 365, SPOT,
+        np.arange(6200, 6900, 50.0), "2026-08-08"), "SPXW")
+    x_leg = _with_roots(synthetic_expiry(
+        6510.0, 0.9970, 30 / 365, SPOT,
+        np.arange(6225, 6925, 50.0), "2026-08-08"), "SPX")
+    x_leg[["bid", "ask"]] += 1.4          # settlement basis offset
+    x_leg["mid_price_shift"] = 0.0
+    chain = pd.concat([w_leg, x_leg], ignore_index=True)
+
+    def pipeline(cfg):
+        clean = clean_chain(chain, SPOT, cfg, asof=ASOF)
+        surf = compute_iv_surface(attach_forwards(clean, SPOT, cfg), cfg)
+        return run_arbitrage_checks(
+            surf, {**DEFAULT_ARB_CONFIG,
+                   "FLAGS_CSV": "outputs/_tmp_flags.csv"})
+
+    vert_mix, bf_mix, _ = pipeline({**OFFLINE_CFG, "OPTION_ROOT": None})
+    assert len(vert_mix) + len(bf_mix) > 0     # mixing manufactures flags
+    vert_fix, bf_fix, _ = pipeline(OFFLINE_CFG)
+    assert vert_fix.empty and bf_fix.empty     # root filter removes them

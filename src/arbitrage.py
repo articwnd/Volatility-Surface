@@ -42,9 +42,14 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 DEFAULT_ARB_CONFIG: dict = {
-    "BUTTERFLY_EPS": 1e-8,   # price tolerance for float noise in convexity
+    "BUTTERFLY_EPS": 1e-8,   # float-noise tolerance for the EXECUTABLE tier
+    # Tier-1 (mid) violations smaller than half a tick are quantization,
+    # not information (measured r5: 37% of live tier-1 flags were within
+    # one $0.05 tick of zero). Reported flags require B_value below this.
+    "REPORT_FLOOR": 0.025,
     "CALENDAR_K_BAND": 0.02,  # |k| band defining "ATM-forward" for the check
     "CALENDAR_EPS": 0.0,      # strict: any decrease in total variance flags
+    "VERTICAL_MAX_DROPS": 50,  # cap on iterative offender removal per slice
     "FLAGS_CSV": os.path.join("outputs", "arbitrage_flags.csv"),
 }
 
@@ -53,6 +58,8 @@ BUTTERFLY_COLUMNS = ["expiry", "K1", "K2", "K3", "C1", "C2", "C3",
 CALENDAR_COLUMNS = ["k_bucket", "expiry_short", "expiry_long",
                     "T_short", "T_long", "w_short", "w_long", "k_short",
                     "k_long"]
+VERTICAL_COLUMNS = ["expiry", "K_low", "K_high", "spread_mid", "max_payoff",
+                    "viol_type", "exec_amount", "executable", "offender"]
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +138,123 @@ def synthesize_call_curve(df_slice: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Vertical spread (monotonicity / slope) static bounds  (added r5)
+# ---------------------------------------------------------------------------
+
+def check_vertical(df_slice: pd.DataFrame, expiry,
+                   config: Optional[dict] = None
+                   ) -> tuple[pd.DataFrame, list[float]]:
+    """Vertical-spread static-bound check for one expiry slice, with
+    iterative attribution of executable violations to specific strikes.
+
+    A call spread C(K_low) - C(K_high), K_low < K_high, must lie in
+    [0, DF*(K_high - K_low)]:
+
+        rising: C(K_high) > C(K_low)          -- calls rising in strike
+        steep:  C(K_low) - C(K_high) > DF*dK  -- spread above max payoff
+
+    Tier 1 (diagnostic, mids, REPORT_FLOOR de-noised) reports both.
+    Tier 2 (executable, at the touch):
+        rising: C_bid(K_high) - C_ask(K_low) > eps   [buy low, sell high,
+                enter at a credit for a non-negative payoff]
+        steep:  C_bid(K_low) - C_ask(K_high) > DF*dK + eps  [sell the
+                spread for more than its discounted max payoff]
+
+    Why this exists: one junk quote (stale/crossed line at a non-standard
+    strike) violates against BOTH neighbors; the butterfly check smears
+    it across up to three triples, while the vertical check pinpoints it
+    (measured r5: the $14-$72 "butterflies" on live data were single
+    impossible quotes with adjacent call slopes of -6.9 then +7.8).
+
+    Attribution: iteratively, the strike involved in the most executable
+    pairs (ties: largest summed magnitude) is recorded as an offender
+    and removed, then pairs are recomputed; capped at VERTICAL_MAX_DROPS.
+    A lone junk quote is involved in 2 pairs and is removed first, so
+    its healthy neighbors survive.
+
+    Returns (flags DataFrame [VERTICAL_COLUMNS], offender strikes list).
+    The `offender` column marks rows whose violation was attributed to
+    that strike during removal (NaN on purely diagnostic rows).
+    """
+    cfg = {**DEFAULT_ARB_CONFIG, **(config or {})}
+    eps = cfg["BUTTERFLY_EPS"]
+    floor = cfg["REPORT_FLOOR"]
+    DF = float(df_slice["DF"].iloc[0])
+    curve = synthesize_call_curve(df_slice)
+
+    def _pairs(c: pd.DataFrame) -> pd.DataFrame:
+        K = c["strike"].to_numpy(dtype=np.float64)
+        Cm = c["call_price"].to_numpy(dtype=np.float64)
+        Cb = c["call_bid"].to_numpy(dtype=np.float64)
+        Ca = c["call_ask"].to_numpy(dtype=np.float64)
+        dK = K[1:] - K[:-1]
+        return pd.DataFrame({
+            "K_low": K[:-1], "K_high": K[1:],
+            "spread_mid": Cm[:-1] - Cm[1:], "max_payoff": DF * dK,
+            "exec_rising": Cb[1:] - Ca[:-1],
+            "exec_steep": (Cb[:-1] - Ca[1:]) - DF * dK,
+        })
+
+    # Iterative executable attribution.
+    offenders: list[float] = []
+    work = curve.copy()
+    for _ in range(cfg["VERTICAL_MAX_DROPS"]):
+        if len(work) < 2:
+            break
+        p = _pairs(work)
+        ex = p[(p["exec_rising"] > eps) | (p["exec_steep"] > eps)]
+        if ex.empty:
+            break
+        strikes = pd.concat([ex["K_low"], ex["K_high"]])
+        counts = strikes.value_counts()
+        top = counts[counts == counts.max()].index
+        if len(top) > 1:
+            mag = {}
+            for s in top:
+                rows = ex[(ex["K_low"] == s) | (ex["K_high"] == s)]
+                mag[s] = float(np.maximum(rows["exec_rising"], 0).sum()
+                               + np.maximum(rows["exec_steep"], 0).sum())
+            worst = max(mag, key=mag.get)
+        else:
+            worst = top[0]
+        offenders.append(float(worst))
+        work = work[work["strike"] != worst]
+
+    if offenders:
+        logger.warning(
+            "check_vertical: expiry %s -- %d strike(s) violate vertical "
+            "static bounds at the touch and were attributed as junk "
+            "quotes: %s", expiry, len(offenders), sorted(offenders),
+        )
+
+    # Diagnostic tier on the ORIGINAL curve, de-noised by the floor.
+    p0 = _pairs(curve)
+    rows = []
+    for _, r in p0.iterrows():
+        rising_mid = -r["spread_mid"]                    # >0 => rising mids
+        steep_mid = r["spread_mid"] - r["max_payoff"]    # >0 => too steep
+        if rising_mid <= floor and steep_mid <= floor:
+            continue
+        viol_type = "rising" if rising_mid > steep_mid else "steep"
+        exec_amt = float(max(r["exec_rising"], r["exec_steep"]))
+        executable = bool(exec_amt > eps)
+        off = np.nan
+        if executable:
+            for s in (r["K_low"], r["K_high"]):
+                if s in offenders:
+                    off = float(s)
+                    break
+        rows.append({
+            "expiry": expiry, "K_low": r["K_low"], "K_high": r["K_high"],
+            "spread_mid": float(r["spread_mid"]),
+            "max_payoff": float(r["max_payoff"]),
+            "viol_type": viol_type, "exec_amount": exec_amt,
+            "executable": executable, "offender": off,
+        })
+    return pd.DataFrame(rows, columns=VERTICAL_COLUMNS), offenders
+
+
+# ---------------------------------------------------------------------------
 # Butterfly (strike) arbitrage
 # ---------------------------------------------------------------------------
 
@@ -174,7 +298,9 @@ def check_butterfly(df_slice: pd.DataFrame, expiry,
         B = w * C1 + (1.0 - w) * C3 - C2
         B_exec = w * Ca[:-2] + (1.0 - w) * Ca[2:] - Cb[1:-1]
         eps = cfg["BUTTERFLY_EPS"]
-        viol = B < -eps
+        # Tier-1 reporting de-noised to the floor; the executable tier
+        # keeps the strict float-noise eps.
+        viol = B < -max(cfg["REPORT_FLOOR"], eps)
         for i in np.flatnonzero(viol):
             rows.append({
                 "expiry": expiry, "K1": K1[i], "K2": K2[i], "K3": K3[i],
@@ -228,7 +354,13 @@ def check_calendar(df: pd.DataFrame,
             "w": float(row["iv"] ** 2 * row["T"]),
         })
 
-    reps_df = pd.DataFrame(reps).sort_values("T").reset_index(drop=True)
+    reps_df = pd.DataFrame(reps)
+    if reps_df.empty:
+        # No expiry had a quote inside the band (e.g. a wings-only
+        # slice): nothing to compare. Return an empty, well-formed
+        # frame rather than crashing on sort_values('T').
+        return pd.DataFrame(columns=CALENDAR_COLUMNS)
+    reps_df = reps_df.sort_values("T").reset_index(drop=True)
     rows = []
     for i in range(len(reps_df)):
         for j in range(i + 1, len(reps_df)):
@@ -251,45 +383,79 @@ def check_calendar(df: pd.DataFrame,
 
 def run_arbitrage_checks(df: pd.DataFrame,
                          config: Optional[dict] = None
-                         ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run both checks across all slices; write the combined flags CSV;
-    print a summary. Returns (butterfly_flags, calendar_flags)."""
+                         ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run all checks across all slices; write the combined flags CSV;
+    print a summary. Returns (vertical_flags, butterfly_flags,
+    calendar_flags).
+
+    Ordering matters (r5): the vertical check runs FIRST and its
+    executable offenders (junk quotes) are removed before butterfly and
+    calendar are computed -- one impossible quote otherwise smears into
+    up to three phantom butterfly triples and pollutes the ATM calendar
+    representative. Offender rows remain in the flags CSV; removal here
+    is from the downstream CHECK INPUT only (exclude_flagged applies the
+    same removal to the fit input).
+    """
     cfg = {**DEFAULT_ARB_CONFIG, **(config or {})}
+
+    vert_frames: list[pd.DataFrame] = []
+    offender_pairs: set[tuple] = set()
+    for expiry, grp in df.groupby("expiry", sort=True):
+        flags, offenders = check_vertical(grp, expiry, cfg)
+        vert_frames.append(flags)
+        offender_pairs.update((expiry, s) for s in offenders)
+    vertical_flags = (
+        pd.concat(vert_frames, ignore_index=True)
+        if vert_frames else pd.DataFrame(columns=VERTICAL_COLUMNS)
+    )
+
+    if offender_pairs:
+        keep = [
+            (exp, k) not in offender_pairs
+            for exp, k in zip(df["expiry"], df["strike"])
+        ]
+        df_checked = df[np.array(keep)]
+    else:
+        df_checked = df
 
     bf_frames = [
         check_butterfly(grp, expiry, cfg)
-        for expiry, grp in df.groupby("expiry", sort=True)
+        for expiry, grp in df_checked.groupby("expiry", sort=True)
     ]
     butterfly_flags = (
         pd.concat(bf_frames, ignore_index=True)
         if bf_frames else pd.DataFrame(columns=BUTTERFLY_COLUMNS)
     )
-    calendar_flags = check_calendar(df, cfg)
+    calendar_flags = check_calendar(df_checked, cfg)
 
     csv_path = cfg["FLAGS_CSV"]
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     combined = pd.concat(
-        [butterfly_flags.assign(check="butterfly"),
+        [vertical_flags.assign(check="vertical"),
+         butterfly_flags.assign(check="butterfly"),
          calendar_flags.assign(check="calendar")],
         ignore_index=True, sort=False,
     )
-    # 'check' first for readability; union of both column sets follows.
     cols = ["check"] + [c for c in combined.columns if c != "check"]
     combined[cols].to_csv(csv_path, index=False)
 
-    n_exp_bf = butterfly_flags["expiry"].nunique() if not butterfly_flags.empty else 0
-    n_exec = int(butterfly_flags["executable"].sum()) if not butterfly_flags.empty else 0
+    n_off = len(offender_pairs)
+    n_exec_bf = int(butterfly_flags["executable"].sum()) if not butterfly_flags.empty else 0
     print(
-        f"run_arbitrage_checks: {len(butterfly_flags)} butterfly mid-flags "
-        f"across {n_exp_bf} expiries ({n_exec} executable at the touch), "
+        f"run_arbitrage_checks: {len(vertical_flags)} vertical flags "
+        f"({n_off} junk-quote strikes attributed), "
+        f"{len(butterfly_flags)} butterfly mid-flags "
+        f"({n_exec_bf} executable), "
         f"{len(calendar_flags)} calendar violations -> {csv_path}"
     )
-    return butterfly_flags, calendar_flags
+    return vertical_flags, butterfly_flags, calendar_flags
 
 
-def exclude_flagged(df: pd.DataFrame, butterfly_flags: pd.DataFrame,
+def exclude_flagged(df: pd.DataFrame, vertical_flags: pd.DataFrame,
+                    butterfly_flags: pd.DataFrame,
                     calendar_flags: pd.DataFrame) -> pd.DataFrame:
-    """Drop EXECUTABLE butterfly middle strikes and repeat-offender
+    """Drop vertical junk-quote offenders, EXECUTABLE butterfly middle
+    strikes, and repeat-offender
     calendar slices from the frame handed to the SVI fit. All flagged
     rows (executable or not) remain in the flags CSV -- exclusion is
     from the FIT only, per spec.
@@ -307,6 +473,20 @@ def exclude_flagged(df: pd.DataFrame, butterfly_flags: pd.DataFrame,
     rule, stated here so it can be argued with rather than discovered.
     """
     out = df
+    if not vertical_flags.empty:
+        off = vertical_flags.dropna(subset=["offender"])
+        if not off.empty:
+            bad = set(zip(off["expiry"], off["offender"]))
+            mask = np.array([
+                (exp, k) not in bad
+                for exp, k in zip(out["expiry"], out["strike"])
+            ])
+            n_drop = int((~mask).sum())
+            out = out[mask]
+            logger.info(
+                "exclude_flagged: dropped %d junk-quote strike(s) failing "
+                "vertical static bounds at the touch", n_drop,
+            )
     if not butterfly_flags.empty:
         exec_flags = butterfly_flags[butterfly_flags["executable"]]
         n_noise = len(butterfly_flags) - len(exec_flags)
@@ -366,7 +546,7 @@ def _main() -> None:
     chain, spot, asof = load_snapshot(args.from_snapshot)
     clean = clean_chain(chain, spot, asof=asof)
     surf = compute_iv_surface(attach_forwards(clean, spot))
-    run_arbitrage_checks(surf)
+    run_arbitrage_checks(surf)  # returns (vertical, butterfly, calendar)
 
 
 if __name__ == "__main__":
