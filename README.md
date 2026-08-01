@@ -36,8 +36,17 @@ extended.
 Options chains are pulled via `yfinance` for a configurable underlying (default:
 SPX). For each expiry, the full chain of calls and puts is collected. Mid-price
 `(bid + ask) / 2` is used as the market price input. Quotes are filtered on:
+- One option root per expiry (`OPTION_ROOT`, default SPXW): a single
+  expiry date can carry AM-settled SPX and PM-settled SPXW products whose
+  price curves differ by a settlement basis; interleaving them by strike
+  manufactures phantom arbitrage (measured: 121 of 153 executable
+  butterfly flags on live data clustered on third Fridays before this
+  filter)
 - Open interest >= `MIN_OI` (default: 100) to remove illiquid strikes
-- Bid > 0 to remove stale or crossed markets
+- Bid > 0, ask > 0, and ask >= bid: a crossed or one-sided row is not a
+  market; its mid is meaningless and its bid/ask poison the executable
+  arbitrage tiers (measured: junk quotes produced phantom $14-$72
+  "executable" violations on live data)
 - Moneyness within `[MONEYNESS_LO, MONEYNESS_HI]` (default: 0.70 to 1.30) to
   discard deep wings where IV inversion is numerically unreliable
 
@@ -79,7 +88,17 @@ discarded.
 
 **Stage 3 -- Arbitrage Checks**
 
-Two no-arbitrage conditions are enforced before any parametric fit:
+Three static no-arbitrage checks run before any parametric fit, in
+order -- vertical first, because one junk quote otherwise smears into
+multiple phantom butterfly triples:
+
+- **Vertical spread (monotonicity/slope) bounds**: a call spread
+  `C(K_low) - C(K_high)` must lie in `[0, DF*(K_high - K_low)]`. The
+  executable tier (rising calls at the touch, or a spread sellable above
+  its discounted max payoff) identifies junk quotes and attributes them
+  to specific strikes iteratively (a lone bad quote violates against
+  both neighbors and is removed first, so healthy neighbors survive).
+  Attributed strikes are excluded before the remaining checks run.
 
 - **Butterfly (strike) arbitrage**: call prices must be convex in strike.
   Because SPX strike spacing is irregular (5/10/25/50 point increments), the
@@ -369,6 +388,23 @@ fallback rate).
 ---
 
 ## Revision Log
+
+- **r5 (2026-07)**: Live-data fixes, driven by the first real SPX run
+  (1,236 flags reviewed). (1) Crossed/one-sided quote guard in cleaning
+  (`ask >= bid > 0`): junk quotes at non-standard strikes had produced
+  phantom $14-$72 "executable" violations. (2) Option-root filter
+  (default SPXW): AM-settled SPX and PM-settled SPXW mixing on third
+  Fridays accounted for 121 of 153 executable butterfly flags at a 19%
+  executable rate vs. 5-6% elsewhere. (3) New vertical-spread static-
+  bound check with executable tiers and iterative offender attribution,
+  run before butterfly/calendar; it pinpoints single bad quotes that the
+  convexity check smears across triples. (4) Tier-1 report floor of half
+  a tick ($0.025) on mid-price diagnostics: 37% of live tier-1 flags
+  were tick quantization. Also fixed a `check_calendar` crash on
+  wings-only slices with no ATM-band quotes. `run_arbitrage_checks` now
+  returns (vertical, butterfly, calendar) and `exclude_flagged` takes
+  all three. Pre-r5 snapshots lack `contractSymbol` and cannot be
+  root-filtered; re-pull to validate fix (2).
 
 - **r4 (2026-07)**: Modules 4-6 built and verified. Added SVI
   identifiability diagnostics (bound-rail warning on all parameters,
