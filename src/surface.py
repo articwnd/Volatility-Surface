@@ -257,8 +257,8 @@ def _main() -> None:
     chain, spot, asof = load_snapshot(args.from_snapshot)
     clean = clean_chain(chain, spot, asof=asof)
     surf_df = compute_iv_surface(attach_forwards(clean, spot))
-    bf, cal = run_arbitrage_checks(surf_df)
-    fit_input = exclude_flagged(surf_df, bf, cal)
+    vert, bf, cal = run_arbitrage_checks(surf_df)
+    fit_input = exclude_flagged(surf_df, vert, bf, cal)
     params = calibrate_all_slices(fit_input)
 
     xc = check_fitted_calendar(params)

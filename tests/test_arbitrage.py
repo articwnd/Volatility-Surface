@@ -13,6 +13,7 @@ from src.arbitrage import (
     DEFAULT_ARB_CONFIG,
     check_butterfly,
     check_calendar,
+    check_vertical,
     exclude_flagged,
     run_arbitrage_checks,
     synthesize_call_curve,
@@ -154,7 +155,8 @@ def test_mid_flag_inside_spread_not_excluded():
     assert not flags.empty
     assert bad_K in set(flags["K2"])
     assert not flags.loc[flags["K2"] == bad_K, "executable"].any()
-    out = exclude_flagged(df, flags, check_calendar(df))
+    empty_vert = pd.DataFrame(columns=["expiry", "offender"])
+    out = exclude_flagged(df, empty_vert, flags, check_calendar(df))
     assert bad_K in set(out["strike"])  # kept: not monetizable
 
 
@@ -169,7 +171,8 @@ def test_violation_beyond_spread_excluded():
     flags = check_butterfly(df, EXPIRY)
     exec_at_bad = flags.loc[flags["K2"] == bad_K, "executable"]
     assert exec_at_bad.any()
-    out = exclude_flagged(df, flags, check_calendar(df))
+    empty_vert = pd.DataFrame(columns=["expiry", "offender"])
+    out = exclude_flagged(df, empty_vert, flags, check_calendar(df))
     assert bad_K not in set(out["strike"])
 
 
@@ -247,19 +250,19 @@ def test_run_arbitrage_checks_writes_csv(tmp_path):
     cfg = {**DEFAULT_ARB_CONFIG,
            "FLAGS_CSV": str(tmp_path / "arbitrage_flags.csv")}
     df = _three_slice_frame(bad_strike=6500.0, hot_expiry="2026-08-08")
-    bf, cal = run_arbitrage_checks(df, cfg)
+    vert, bf, cal = run_arbitrage_checks(df, cfg)
     assert not bf.empty and not cal.empty
     written = pd.read_csv(tmp_path / "arbitrage_flags.csv")
-    assert set(written["check"]) == {"butterfly", "calendar"}
-    assert len(written) == len(bf) + len(cal)
+    assert set(written["check"]) >= {"butterfly", "calendar"}
+    assert len(written) == len(vert) + len(bf) + len(cal)
 
 
 def test_exclude_flagged_butterfly_drops_middle_strike():
     df = _three_slice_frame(bad_strike=6500.0)
-    bf, cal = run_arbitrage_checks(
+    vert, bf, cal = run_arbitrage_checks(
         df, {**DEFAULT_ARB_CONFIG, "FLAGS_CSV": "outputs/_tmp_flags.csv"})
     assert cal.empty
-    out = exclude_flagged(df, bf, cal)
+    out = exclude_flagged(df, vert, bf, cal)
     exp = pd.Timestamp("2026-08-08")
     dropped = set(bf["K2"])
     kept = set(out.loc[out["expiry"] == exp, "strike"])
@@ -274,10 +277,10 @@ def test_exclude_flagged_calendar_drops_repeat_offender():
     """The hot short slice violates against BOTH longer maturities
     (2 pairs), so the exclusion rule drops the whole slice."""
     df = _three_slice_frame(hot_expiry="2026-08-08")
-    bf, cal = run_arbitrage_checks(
+    vert, bf, cal = run_arbitrage_checks(
         df, {**DEFAULT_ARB_CONFIG, "FLAGS_CSV": "outputs/_tmp_flags.csv"})
     assert len(cal) == 2
-    out = exclude_flagged(df, bf, cal)
+    out = exclude_flagged(df, vert, bf, cal)
     assert pd.Timestamp("2026-08-08") not in set(out["expiry"])
     assert out["expiry"].nunique() == 2
 
@@ -291,6 +294,87 @@ def test_pipeline_end_to_end_clean():
     clean = clean_chain(make_chain(), SPOT, OFFLINE_CFG, asof=ASOF)
     surf = compute_iv_surface(attach_forwards(clean, SPOT, OFFLINE_CFG),
                               OFFLINE_CFG)
-    bf, cal = run_arbitrage_checks(
+    vert, bf, cal = run_arbitrage_checks(
         surf, {**DEFAULT_ARB_CONFIG, "FLAGS_CSV": "outputs/_tmp_flags.csv"})
-    assert bf.empty and cal.empty
+    assert vert.empty and bf.empty and cal.empty
+
+
+# ---------------------------------------------------------------------------
+# Vertical static bounds (r5)
+# ---------------------------------------------------------------------------
+
+def test_vertical_clean_slice():
+    df = _otm_slice(UNEQUAL_STRIKES, half_spread=0.35)
+    flags, offenders = check_vertical(df, EXPIRY)
+    assert flags.empty and offenders == []
+
+
+def test_vertical_monster_replica_attribution():
+    """Replica of the live 2027-03-31 junk quote: C(7910)=327 between
+    258 and 249 with ~$1 spreads. The middle strike must be attributed
+    as the sole offender; both healthy neighbors survive."""
+    F_, DF_ = 7480.0, 0.97
+    rows = []
+    for K, mid in ((7900.0, 258.45), (7910.0, 327.15), (7920.0, 248.95)):
+        rows.append({"expiry": EXPIRY, "strike": K, "option_type": "call",
+                     "mid_price": mid, "bid": mid - 0.55, "ask": mid + 0.55,
+                     "F": F_, "DF": DF_, "T": 0.66,
+                     "k": np.log(K / F_), "iv": 0.2})
+    df = pd.DataFrame(rows)
+    flags, offenders = check_vertical(df, EXPIRY)
+    assert offenders == [7910.0]
+    assert not flags.empty
+    assert (flags["executable"]).any()
+    assert set(flags["viol_type"]) == {"rising", "steep"}  # both sides hit
+    # runner removes the offender before butterfly: no butterfly flags
+    vert, bf, cal = run_arbitrage_checks(
+        df, {**DEFAULT_ARB_CONFIG, "FLAGS_CSV": "outputs/_tmp_flags.csv"})
+    assert bf.empty
+    out = exclude_flagged(df, vert, bf, cal)
+    assert set(out["strike"]) == {7900.0, 7920.0}
+
+
+def test_vertical_mid_only_not_attributed():
+    """A rising-mid wiggle that no check can monetize: tier-1 vertical
+    flag, no offender, and the strike survives exclusion.
+
+    Regime matters: at wide spacing the natural per-step price decline
+    is large, so any bump big enough to create rising mids is also an
+    EXECUTABLE butterfly (correctly excluded -- first draft of this test
+    got that wrong). Deep-OTM 5-point spacing has a small natural
+    decline, so a bump of decline + $0.10 makes mids rise while staying
+    far inside both the vertical and butterfly touch thresholds
+    (~2*half_spread = $1.20)."""
+    hs = 0.60
+    df = _otm_slice(np.arange(7000.0, 7060.0, 5.0), half_spread=hs).copy()
+    bad_K = 7025.0
+    curve = synthesize_call_curve(df).set_index("strike")["call_price"]
+    natural_decline = float(curve.loc[7020.0] - curve.loc[bad_K])
+    assert natural_decline < 0.5          # regime check: tight spacing
+    bump = natural_decline + 0.10
+    df.loc[df["strike"] == bad_K, ["mid_price", "bid", "ask"]] += bump
+    flags, offenders = check_vertical(df, EXPIRY)
+    assert offenders == []
+    assert (flags["viol_type"] == "rising").any()
+    assert not flags["executable"].any()
+    vert, bf, cal = run_arbitrage_checks(
+        df, {**DEFAULT_ARB_CONFIG, "FLAGS_CSV": "outputs/_tmp_flags.csv"})
+    assert bf.empty or not bf["executable"].any()
+    out = exclude_flagged(df, vert, bf, cal)
+    assert bad_K in set(out["strike"])
+
+
+def test_butterfly_report_floor():
+    """Tier-1 butterfly flags below REPORT_FLOOR (tick quantization) are
+    not reported; a floor of 0 restores them."""
+    df = _otm_slice(np.arange(6400.0, 6650.0, 25.0), half_spread=0.35).copy()
+    bad_K = 6500.0
+    # chord gap here ~$0.37; +0.385 leaves a residual breach ~ $0.015,
+    # under the 0.025 floor
+    df.loc[df["strike"] == bad_K, ["mid_price", "bid", "ask"]] += 0.385
+    hi = check_butterfly(df, EXPIRY)
+    lo = check_butterfly(df, EXPIRY,
+                         {**DEFAULT_ARB_CONFIG, "REPORT_FLOOR": 0.0})
+    assert set(hi["K2"]) <= set(lo["K2"])
+    only_small = set(lo["K2"]) - set(hi["K2"])
+    assert bad_K in only_small or hi.empty

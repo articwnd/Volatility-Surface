@@ -361,7 +361,24 @@ breaches isolate bad quotes rather than model bias.
 
 ## Module 3: `src/arbitrage.py`
 
-**Purpose**: flag butterfly and calendar arbitrage violations before fitting.
+**Purpose**: flag vertical, butterfly, and calendar arbitrage violations
+before fitting. Checks run vertical-first (r5): executable vertical
+offenders are junk quotes, and removing them before butterfly/calendar
+prevents one bad quote from smearing into multiple phantom flags.
+
+### `check_vertical(df_slice, expiry, config) -> (pd.DataFrame, list)`  *(added r5)*
+
+Two-tier vertical-spread static bounds per expiry: a call spread
+`C(K_low) - C(K_high)` must lie in `[0, DF*dK]`. Tier 1 (mids,
+REPORT_FLOOR de-noised) is diagnostic; tier 2 (executable: rising calls
+at the touch `C_bid(K_high) > C_ask(K_low)`, or a spread sellable above
+discounted max payoff `C_bid(K_low) - C_ask(K_high) > DF*dK`) drives
+exclusion. Executable violations are attributed to specific strikes
+iteratively: the strike involved in the most executable pairs (ties:
+largest magnitude) is recorded as an offender and removed, repeated to
+a cap. Returns (flags with an `offender` column, offender strike list).
+Rationale from live data: single impossible quotes (adjacent call
+slopes -6.9 then +7.8) masqueraded as $14-$72 "butterflies".
 
 ---
 
@@ -452,7 +469,13 @@ results.
 4. Print a summary: "N butterfly violations across M expiries,
    K calendar violations."
 
-**Returns**: `(butterfly_flags_df, calendar_flags_df)`.
+**Returns** *(r5)*: `(vertical_flags, butterfly_flags, calendar_flags)`.
+Vertical runs first; its attributed offenders are removed from the
+input of the butterfly and calendar checks (and from the fit input in
+`exclude_flagged`). All flags of all three checks land in one CSV with
+a `check` column. Tier-1 mid diagnostics for vertical and butterfly are
+reported only below `-REPORT_FLOOR` (default half a tick, $0.025);
+measured on live data, 37% of strict tier-1 flags were quantization.
 
 ---
 

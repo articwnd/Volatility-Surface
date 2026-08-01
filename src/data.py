@@ -48,6 +48,14 @@ DEFAULT_CONFIG: dict = {
     "MAX_EXPIRY_DAYS": 365,   # drop far-dated slices (sparse data)
     "FWD_BAND": 0.10,         # +/- K/S band for parity pairs
     "FWD_MIN_PAIRS": 3,       # min call-put pairs to imply forward
+    # Preferred option root when one expiry carries multiple products
+    # (e.g. AM-settled SPX and PM-settled SPXW on third Fridays -- mixing
+    # them interleaves two price curves and manufactures phantom
+    # arbitrage; measured r5: 121/153 executable butterfly flags
+    # clustered on third Fridays before this filter). SPXW's PM
+    # settlement matches the close-of-day snapshot and the calendar-day
+    # T convention. None disables root filtering.
+    "OPTION_ROOT": "SPXW",
     # Fallback continuously compounded rate, used only if FRED is
     # unreachable AND no RISK_FREE_RATE override is set.
     # VERIFY against current DGS3MO before relying on it -- rates have been
@@ -63,8 +71,8 @@ DEFAULT_CONFIG: dict = {
 }
 
 REQUIRED_CHAIN_COLUMNS = [
-    "strike", "lastPrice", "bid", "ask", "volume", "openInterest",
-    "impliedVolatility", "option_type", "expiry",
+    "contractSymbol", "strike", "lastPrice", "bid", "ask", "volume",
+    "openInterest", "impliedVolatility", "option_type", "expiry",
 ]
 
 _FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO"
@@ -169,9 +177,9 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
     """
     import yfinance as yf
     try:
-        from yfinance.exceptions import YFRateLimitError
+        from yfinance.exceptions import YfRateLimitError
     except ImportError:  # older layout; treat as generic failure
-        YFRateLimitError = ()  # type: ignore[assignment]
+        YfRateLimitError = ()  # type: ignore[assignment]
 
     cfg = {**DEFAULT_CONFIG, **(config or {})}
     tk = yf.Ticker(ticker)
@@ -181,7 +189,7 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
         try:
             expiries = tk.options
             break
-        except YFRateLimitError:
+        except YfRateLimitError:
             wait = cfg["YF_BACKOFF_S"] * (2 ** attempt)
             logger.warning("yfinance rate limited; retrying in %.0fs", wait)
             time.sleep(wait)
@@ -194,7 +202,7 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
             try:
                 oc = tk.option_chain(exp_str)
                 break
-            except YFRateLimitError:
+            except YfRateLimitError:
                 wait = cfg["YF_BACKOFF_S"] * (2 ** attempt)
                 logger.warning("rate limited on %s; retrying in %.0fs", exp_str, wait)
                 time.sleep(wait)
@@ -217,7 +225,7 @@ def fetch_chain(ticker: str, config: Optional[dict] = None) -> pd.DataFrame:
     now = pd.Timestamp.now().normalize()
     assert (df["expiry"] >= now).all(), "chain contains past expiries"
     print(f"fetch_chain: {len(df)} rows across {df['expiry'].nunique()} expiries")
-    return df  # pyright: ignore[reportReturnType] -- column-list indexing is DataFrame at runtime
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +274,14 @@ def load_snapshot(path: str) -> tuple[pd.DataFrame, float, pd.Timestamp]:
 
     df["expiry"] = pd.to_datetime(df["expiry"])
     df["option_type"] = df["option_type"].astype(str)
+    if "contractSymbol" in df.columns:
+        df["contractSymbol"] = df["contractSymbol"].astype(str)
+    else:
+        logger.warning(
+            "load_snapshot: %s predates r5 (no contractSymbol column); "
+            "the option-root filter cannot run and settlement-mixed "
+            "expiries may carry phantom arbitrage. Re-pull to fix.", path,
+        )
     for col in ("strike", "lastPrice", "bid", "ask", "impliedVolatility"):
         df[col] = df[col].astype(np.float64)
     for col in ("volume", "openInterest"):
@@ -275,7 +291,76 @@ def load_snapshot(path: str) -> tuple[pd.DataFrame, float, pd.Timestamp]:
 
     spot = float(meta["spot"])
     asof = pd.Timestamp(meta["asof"])
-    return df, spot, asof  # pyright: ignore[reportReturnType] -- asof came from a real isoformat() string, never NaT
+    return df, spot, asof
+
+
+# ---------------------------------------------------------------------------
+# Option-root filtering (r5)
+# ---------------------------------------------------------------------------
+
+_ROOT_RE = __import__("re").compile(r"^([A-Z]+)")
+
+
+def option_root(contract_symbol: str) -> str:
+    """Root ticker from an OCC-style contract symbol: the leading alpha
+    run, e.g. 'SPXW260821C05700000' -> 'SPXW', 'SPX...' -> 'SPX'."""
+    m = _ROOT_RE.match(str(contract_symbol))
+    return m.group(1) if m else ""
+
+
+def filter_option_root(df: pd.DataFrame,
+                       config: Optional[dict] = None) -> pd.DataFrame:
+    """Keep exactly one option root per expiry.
+
+    Per expiry: keep only OPTION_ROOT if present; otherwise, if a single
+    root exists, keep it; if multiple non-preferred roots exist, keep the
+    most-quoted one and warn. Rationale: one expiry date can carry
+    multiple products with different settlement (AM-settled SPX vs
+    PM-settled SPXW on third Fridays); their price curves differ by a
+    settlement basis, and interleaving them by strike manufactures
+    convexity violations that are not arbitrage.
+
+    No-ops with a warning when contractSymbol is absent (pre-r5
+    snapshots) or when OPTION_ROOT is None.
+    """
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
+    preferred = cfg["OPTION_ROOT"]
+    if preferred is None:
+        return df
+    if "contractSymbol" not in df.columns:
+        logger.warning(
+            "filter_option_root: no contractSymbol column; root filter "
+            "skipped -- settlement-mixed expiries may carry phantom "
+            "arbitrage"
+        )
+        return df
+
+    df = df.copy()
+    roots = df["contractSymbol"].map(option_root)
+    kept: list[pd.DataFrame] = []
+    for expiry, grp in df.groupby("expiry", sort=True):
+        r = roots.loc[grp.index]
+        present = r.value_counts()
+        if preferred in present.index:
+            chosen = preferred
+        elif len(present) == 1:
+            chosen = present.index[0]
+        else:
+            chosen = present.idxmax()
+            logger.warning(
+                "filter_option_root: expiry %s has roots %s, none "
+                "preferred (%s); keeping most-quoted %s",
+                expiry, list(present.index), preferred, chosen,
+            )
+        dropped = int((r != chosen).sum())
+        if dropped:
+            logger.info(
+                "filter_option_root: expiry %s kept root %s, dropped %d "
+                "row(s) from %s", expiry, chosen, dropped,
+                [x for x in present.index if x != chosen],
+            )
+        kept.append(grp[r == chosen])
+    return pd.concat(kept, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -304,14 +389,28 @@ def clean_chain(
     assert np.isfinite(spot) and spot > 0, f"bad spot: {spot}"
 
     df = df.copy()
+    # 0. one option root per expiry (settlement-mixing guard, r5)
+    n_pre = len(df)
+    df = filter_option_root(df, cfg)
     n0 = len(df)
 
     def _report(step: str, before: int, after: int) -> None:
         print(f"clean_chain [{step}]: dropped {before - after}, kept {after}")
 
-    # 1. stale / crossed markets
+    _report("option root", n_pre, n0)
+
+    # 1. stale markets
     df = df[df["bid"] > 0]
     n1 = len(df); _report("bid>0", n0, n1)
+
+    # 1b. crossed/locked quote guard (r5): a row with ask <= 0 or
+    # ask < bid is not a market; its mid is meaningless and, worse, its
+    # bid/ask poison the executable arbitrage tiers (measured r5: junk
+    # quotes at non-standard strikes produced phantom $14-$72
+    # "executable" violations).
+    df = df[(df["ask"] > 0) & (df["ask"] >= df["bid"])]
+    n1b = len(df); _report("ask>=bid>0", n1, n1b)
+    n1 = n1b
 
     # 2. illiquid strikes
     df = df[df["openInterest"].fillna(0) >= cfg["MIN_OI"]]
