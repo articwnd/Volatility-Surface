@@ -389,6 +389,14 @@ fallback rate).
 
 ## Revision Log
 
+- **r6 (2026-08)**: `notebooks/surface_explorer.ipynb` added -- the last
+  item in the project structure. Auto-detects the most recent snapshot in
+  `data/snapshots/` (including pre-r5 snapshots, with the backward-compat
+  warnings surfaced); with none present it generates a synthetic demo
+  chain containing the r5 failure modes (SPX/SPXW mix, junk quote, quote
+  noise) so every guardrail is visible. Ends with the live-run validation
+  checklist. Verified by headless execution on both branches.
+
 - **r5 (2026-07)**: Live-data fixes, driven by the first real SPX run
   (1,236 flags reviewed). (1) Crossed/one-sided quote guard in cleaning
   (`ask >= bid > 0`): junk quotes at non-standard strikes had produced
